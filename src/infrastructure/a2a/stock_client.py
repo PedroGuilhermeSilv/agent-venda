@@ -2,7 +2,6 @@
 Cliente A2A para consultar o Agente de Estoque
 """
 
-
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
 
@@ -28,16 +27,32 @@ class StockA2AClient:
 
         class AskStockAgentTool(BaseTool):
             name: str = "ask_stock_agent"
-            description: str = (
-                "Útil para consultar informações de estoque, buscar produtos na Shopee, ou saber mais sobre disponibilidade, preços e categorias."
-            )
+            description: str = "Útil para consultar informações de estoque, buscar produtos na Shopee, ou saber mais sobre disponibilidade, preços e categorias."
             args_schema: type[BaseModel] = AskStockAgentArgs
 
             def _run(self, query: str) -> str:
                 raise NotImplementedError("Use a versão assíncrona _arun")
 
-            async def _arun(self, query: str) -> str:
-                return await client_instance.ask_agent(query)
+            async def _arun(self, query: str, run_manager=None, **kwargs) -> str:
+                # Obter o trace_id explícito e o span_id original pra engatar a árvore
+                langfuse_trace_id = None
+                span_id = None
+
+                if run_manager:
+                    if getattr(run_manager, "metadata", None):
+                        langfuse_trace_id = run_manager.metadata.get("langfuse_trace_id")
+
+                    if hasattr(run_manager, "run_id"):
+                        span_id = str(run_manager.run_id)
+
+                # Converter para o formato W3C de Traceparent para opentelemetry conectar nativamente!
+                traceparent = None
+                if langfuse_trace_id and span_id:
+                    # langfuse_trace_id = 32 hex chars, span_id = uuid, extraimos 16 hex chars
+                    span_16 = span_id.replace("-", "")[:16]
+                    traceparent = f"00-{langfuse_trace_id}-{span_16}-01"
+
+                return await client_instance.ask_agent(query, traceparent=traceparent)
 
         return AskStockAgentTool()
 
@@ -45,11 +60,13 @@ class StockA2AClient:
         """Retorna as ferramentas para o Agent de Vendas"""
         return [self._create_tool()]
 
-    async def ask_agent(self, query: str) -> str:
+    async def ask_agent(self, query: str, traceparent: str = None) -> str:
         """
         Envia uma mensagem para o Agente de Estoque via A2A.
         """
         print(f"🔌 Consultando Agente de Estoque: {query}")
+        if traceparent:
+            print(f"🔗 Repassando Traceparent pro Estoque: {traceparent}")
 
         import httpx
         from a2a.client import ClientConfig, ClientFactory
@@ -57,7 +74,12 @@ class StockA2AClient:
         from a2a.types import Message
 
         try:
-            config = ClientConfig(httpx_client=httpx.AsyncClient(timeout=120.0))
+            headers = {}
+            if traceparent:
+                # O padrão W3C traceparent automaticamente diz ao OpenTelemetry para atrelar os spans desta requisição ao trace de origem.
+                headers["traceparent"] = traceparent
+
+            config = ClientConfig(httpx_client=httpx.AsyncClient(timeout=120.0, headers=headers))
             client = await ClientFactory.connect(self.a2a_server_url, client_config=config)
             message = create_text_message_object("user", query)
 
@@ -77,11 +99,13 @@ class StockA2AClient:
 
                 # 2) If it's a Task chunk (with history or status stream)
                 elif hasattr(item, "history") or hasattr(item, "status"):
-
                     # Sometimes final answer is just in the history of a completed Task
                     if hasattr(item, "history") and item.history:
                         for hist_msg in item.history:
-                            if hasattr(hist_msg, "role") and getattr(hist_msg.role, "value", None) == "agent":
+                            if (
+                                hasattr(hist_msg, "role")
+                                and getattr(hist_msg.role, "value", None) == "agent"
+                            ):
                                 if getattr(hist_msg, "parts", None):
                                     for part in hist_msg.parts:
                                         if hasattr(part.root, "text"):

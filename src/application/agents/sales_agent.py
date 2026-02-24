@@ -4,7 +4,13 @@ Agent de venda usando LangGraph
 
 from typing import Annotated, Any, TypedDict
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
@@ -57,10 +63,14 @@ class SalesAgent:
         self.tools = self.stock_a2a_client.get_tools()
 
         if not self.tools:
-            print("⚠️  Nenhuma ferramenta A2A carregada. O agent funcionará sem ferramentas.")
+            print(
+                "⚠️  Nenhuma ferramenta A2A carregada. O agent funcionará sem ferramentas."
+            )
 
         # Bind tools ao LLM
-        self.llm_with_tools = self.llm.bind_tools(self.tools) if self.tools else self.llm
+        self.llm_with_tools = (
+            self.llm.bind_tools(self.tools) if self.tools else self.llm
+        )
 
         # Criar ToolNode para executar ferramentas
         self.tool_node = ToolNode(self.tools) if self.tools else None
@@ -82,7 +92,9 @@ class SalesAgent:
             if hasattr(last_message, "tool_calls") and last_message.tool_calls:
                 print(f"🔧 Executando {len(last_message.tool_calls)} ferramenta(s)...")
                 for tool_call in last_message.tool_calls:
-                    print(f"   - {tool_call.get('name', 'unknown')}: {tool_call.get('args', {})}")
+                    print(
+                        f"   - {tool_call.get('name', 'unknown')}: {tool_call.get('args', {})}"
+                    )
                 return "tools"
 
             # Caso contrário, termina
@@ -122,7 +134,9 @@ class SalesAgent:
 
         # Adicionar arestas condicionais
         if self.tool_node:
-            workflow.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
+            workflow.add_conditional_edges(
+                "agent", should_continue, {"tools": "tools", END: END}
+            )
             # Após executar ferramentas, volta para o agent
             workflow.add_edge("tools", "agent")
         else:
@@ -135,9 +149,9 @@ class SalesAgent:
 
     async def process_message(
         self, trace_id: str, user_message: str, system_prompt: str = None
-    ) -> str:
+    ) -> "AsyncGenerator[str, None]":
         """
-        Processa uma mensagem do usuário e retorna a resposta do agent
+        Processa uma mensagem do usuário e retorna a resposta do agent em forma de stream
 
         Args:
             trace_id: ID único da conversa (número de celular com DDD)
@@ -145,7 +159,7 @@ class SalesAgent:
             system_prompt: Prompt do sistema (opcional)
 
         Returns:
-            Resposta do agent
+            Um iterador assíncrono (AsyncGenerator) gerando a resposta
         """
         # Garantir que as ferramentas estão inicializadas
         await self._initialize_tools()
@@ -220,56 +234,88 @@ Formate bem a listagem de produtos com:
         # Config para o LangGraph (sem checkpointer, usamos Redis para histórico)
         config = {}
 
+        # Configurar Langfuse se as credenciais estiverem disponíveis
+        from ...config import get_settings
+
+        settings = get_settings()
+
+        if settings.langfuse_public_key and settings.langfuse_secret_key:
+            import os
+
+            # O SDK v3 do Langfuse lerá estas variáveis de ambiente por padrão
+            os.environ["LANGFUSE_PUBLIC_KEY"] = settings.langfuse_public_key
+            os.environ["LANGFUSE_SECRET_KEY"] = settings.langfuse_secret_key
+            os.environ["LANGFUSE_HOST"] = settings.langfuse_host
+
+            try:
+                from langfuse import Langfuse
+                from langfuse.langchain import CallbackHandler
+
+                # Verifica as chaves usando o Cliente puro
+                lf_client = Langfuse()
+                if not lf_client.auth_check():
+                    print(
+                        "⚠️ Langfuse: Falha na autenticação. Verifique suas chaves e host."
+                    )
+                else:
+                    # Gera um trace customizado válido e único por mensagem para agrupar Vendas + Estoque
+                    current_trace_id = lf_client.create_trace_id()
+                    print(
+                        f"📊 Langfuse tracing ativado para sessão {trace_id} (Trace unificado: {current_trace_id[:8]}...)"
+                    )
+
+                    langfuse_handler = CallbackHandler(
+                        trace_context={"trace_id": current_trace_id}
+                    )
+                    config["callbacks"] = [langfuse_handler]
+                    config["metadata"] = {
+                        "langfuse_session_id": trace_id,
+                        "langfuse_user_id": trace_id,
+                        "langfuse_trace_id": current_trace_id,  # Salva pra repassar via metadados p/ ferramentas
+                    }
+            except ImportError as e:
+                print(f"⚠️ Langfuse não carregado ({e}). Execute: poetry add langfuse")
+
         # Executar o agent usando astream para ver o progresso
-        # O LangGraph vai executar automaticamente as ferramentas quando necessário
+        # yieldando chunks para o websocket
         all_new_messages = []
 
         import asyncio
 
-        async def process_stream():
-            """Processa o stream do graph com logs detalhados"""
-            async for event in self.graph.astream(
-                {"messages": messages}, config=config, stream_mode="updates"
-            ):
-                # Acumular todas as atualizações de cada nó
-                for node_name, node_data in event.items():
-                    if "messages" in node_data:
-                        new_msgs = node_data["messages"]
-                        all_new_messages.extend(new_msgs)
-
-                        # Log detalhado de cada mensagem do nó
-                        print(f"\n📝 Node '{node_name}' retornou {len(new_msgs)} mensagem(ns):")
-                        for msg in new_msgs:
-                            if isinstance(msg, ToolMessage):
-                                print(f"   🔧 ToolMessage ({msg.name}):")
-                                content = msg.content
-                                if isinstance(content, str):
-                                    print(
-                                        f"      📄 {content[:300]}{'...' if len(content) > 300 else ''}"
-                                    )
-                                else:
-                                    import json
-
-                                    content_str = json.dumps(content, indent=2, ensure_ascii=False)
-                                    print(
-                                        f"      📄 {content_str[:300]}{'...' if len(content_str) > 300 else ''}"
-                                    )
-                            elif isinstance(msg, AIMessage):
-                                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                                    print(f"   🤖 AIMessage (com {len(msg.tool_calls)} tool_calls)")
-                                    for tc in msg.tool_calls:
-                                        print(f"      - {tc.get('name')}: {tc.get('args')}")
-                                else:
-                                    content_preview = (
-                                        msg.content[:150] if msg.content else "(vazio)"
-                                    )
-                                    print(
-                                        f"   🤖 AIMessage: {content_preview}{'...' if len(msg.content or '') > 150 else ''}"
-                                    )
+        final_content = ""
 
         try:
-            # Timeout de 60 segundos para evitar travamento
-            await asyncio.wait_for(process_stream(), timeout=60.0)
+            # Utilizamos o astream_events do langchain para capturar pedaços da stream da AI em tempo real
+            async for event in self.graph.astream_events(
+                {"messages": messages}, config=config, version="v1"
+            ):
+                kind = event["event"]
+
+                # Se for um pedacinho de stream do modelo de chat gerando a resposta final
+                if kind == "on_chat_model_stream":
+                    chunk = event["data"]["chunk"]
+                    if hasattr(chunk, "content") and chunk.content:
+                        content_piece = chunk.content
+                        if isinstance(content_piece, str):
+                            final_content += content_piece
+                            yield content_piece
+
+                # Registrar as mensagens consolidadas que os nós devolvem para guardar no banco
+                elif kind == "on_chain_end" and event.get("name") in ["agent", "tools"]:
+                    node_outputs = event["data"].get("output", {})
+                    if isinstance(node_outputs, dict) and "messages" in node_outputs:
+                        new_msgs = node_outputs["messages"]
+                        if isinstance(new_msgs, list):
+                            all_new_messages.extend(
+                                [
+                                    m
+                                    for m in new_msgs
+                                    if m.id not in [x.id for x in all_new_messages]
+                                ]
+                            )
+                        else:
+                            all_new_messages.append(new_msgs)
+
         except asyncio.TimeoutError:
             print("⚠️ Timeout ao processar mensagem (60s)")
         except Exception as e:
@@ -278,42 +324,8 @@ Formate bem a listagem de produtos com:
 
             traceback.print_exc()
 
-        # Combinar mensagens originais com as novas
-        final_messages = messages + all_new_messages
-
-        print(f"\n{'='*60}")
-        print(
-            f"📊 Resumo: {len(messages)} msgs originais + {len(all_new_messages)} novas = {len(final_messages)} total"
-        )
-        print(f"{'='*60}")
-
-        # Obter resposta do agent (última mensagem do assistente que não seja tool call)
-        ai_response = None
-
-        for msg in reversed(final_messages):
-            # Verificar se é uma mensagem de ferramenta (resultado de tool execution)
-            if isinstance(msg, ToolMessage):
-                continue
-
-            # Verificar se é uma mensagem do assistente com conteúdo
-            if isinstance(msg, AIMessage):
-                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    # Esta mensagem tem tool_calls, mas não é a resposta final
-                    continue
-                if msg.content and msg.content.strip():
-                    ai_response = msg.content
-                    print(f"💬 Resposta final selecionada: {len(ai_response)} caracteres")
-                    break
-
-        # Se ainda não encontrou resposta, pegar qualquer mensagem do assistente
-        if not ai_response:
-            for msg in reversed(final_messages):
-                if isinstance(msg, AIMessage) and msg.content:
-                    ai_response = msg.content
-                    break
-
-        if not ai_response:
-            ai_response = "Desculpe, não consegui processar sua mensagem."
+        if not final_content:
+            final_content = "Desculpe, não consegui processar sua mensagem."
 
         # Salvar mensagens no histórico
         from datetime import datetime
@@ -321,13 +333,22 @@ Formate bem a listagem de produtos com:
         from ...domain.entities.message import Message, MessageRole
 
         # Salvar mensagem do usuário
-        user_msg = Message(role=MessageRole.USER, content=user_message, timestamp=datetime.now())
+        user_msg = Message(
+            role=MessageRole.USER, content=user_message, timestamp=datetime.now()
+        )
         await self.conversation_repository.add_message(trace_id, user_msg)
 
         # Salvar resposta do agent
         assistant_msg = Message(
-            role=MessageRole.ASSISTANT, content=ai_response, timestamp=datetime.now()
+            role=MessageRole.ASSISTANT, content=final_content, timestamp=datetime.now()
         )
         await self.conversation_repository.add_message(trace_id, assistant_msg)
 
-        return ai_response
+        # Garantir flush no langfuse ao final
+        try:
+            if "callbacks" in config:
+                for callback in config["callbacks"]:
+                    if hasattr(callback, "flush"):
+                        callback.flush()
+        except Exception:
+            pass

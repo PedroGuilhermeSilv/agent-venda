@@ -31,6 +31,7 @@ httpx = ">=0.28.1"
 pydantic = "^2.9.2"
 pydantic-settings = "^2.5.0"
 google-adk = {extras = ["a2a"], version = "^1.25.1"}
+langfuse = {extras = ["langchain"], version = "^3.14.4"}
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"

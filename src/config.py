@@ -2,7 +2,6 @@
 Configuração da aplicação com validação de variáveis de ambiente
 """
 
-
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -32,6 +31,21 @@ class Settings(BaseSettings):
     # Server Configuration
     host: str = Field(default="0.0.0.0", description="Host do servidor")
     port: int = Field(default=8000, ge=1, le=65535, description="Porta do servidor (1-65535)")
+
+    # Langfuse Configuration
+    langfuse_public_key: str | None = Field(default=None, description="Public key do Langfuse")
+    langfuse_secret_key: str | None = Field(default=None, description="Secret key do Langfuse")
+    langfuse_host: str = Field(
+        default="http://host.docker.internal:3000", description="Host do Langfuse"
+    )
+
+    def model_post_init(self, __context):
+        if self.langfuse_public_key:
+            self.langfuse_public_key = self.langfuse_public_key.strip('"').strip("'")
+        if self.langfuse_secret_key:
+            self.langfuse_secret_key = self.langfuse_secret_key.strip('"').strip("'")
+        if self.langfuse_host:
+            self.langfuse_host = self.langfuse_host.strip('"').strip("'")
 
     @field_validator("gemini_api_key")
     @classmethod

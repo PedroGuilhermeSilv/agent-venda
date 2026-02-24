@@ -96,11 +96,18 @@ class WebSocketServer:
                         # Processar mensagem com o agent
                         try:
                             system_prompt = message_data.get("system_prompt")
-                            response = await self.send_message_use_case.execute(
-                                trace_id=trace_id, message=user_message, system_prompt=system_prompt
-                            )
 
-                            # Enviar resposta
+                            response = ""
+
+                            # process_message agora retorna um Async Generator que yields chunks
+                            async for chunk in self.send_message_use_case.execute(
+                                trace_id=trace_id, message=user_message, system_prompt=system_prompt
+                            ):
+                                response += chunk
+                                # Enviar o pedacinho do texto pro client renderizar na tela via streaming
+                                await websocket.send_json({"type": "stream", "chunk": chunk})
+
+                            # Enviar sinalização final e a resposta consolidada só por garantia
                             await websocket.send_json({"type": "response", "message": response})
                         except Exception as e:
                             await websocket.send_json(
@@ -136,9 +143,7 @@ class WebSocketServer:
             except Exception as e:
                 print(f"Erro na conexão WebSocket: {e}")
                 try:
-                    await websocket.send_json(
-                        {"type": "error", "message": f"Erro interno: {e!s}"}
-                    )
+                    await websocket.send_json({"type": "error", "message": f"Erro interno: {e!s}"})
                 except Exception:
                     pass
 
